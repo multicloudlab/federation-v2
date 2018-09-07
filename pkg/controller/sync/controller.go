@@ -26,9 +26,11 @@ import (
 	"github.com/kubernetes-sigs/federation-v2/pkg/apis/core/typeconfig"
 	fedv1a1 "github.com/kubernetes-sigs/federation-v2/pkg/apis/core/v1alpha1"
 	fedclientset "github.com/kubernetes-sigs/federation-v2/pkg/client/clientset/versioned"
+	"github.com/kubernetes-sigs/federation-v2/pkg/controller/configgeneration"
 	"github.com/kubernetes-sigs/federation-v2/pkg/controller/sync/placement"
 	"github.com/kubernetes-sigs/federation-v2/pkg/controller/util"
 	"github.com/kubernetes-sigs/federation-v2/pkg/controller/util/deletionhelper"
+	"github.com/kubernetes-sigs/federation-v2/pkg/features"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -38,6 +40,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apimachinery/pkg/watch"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/client-go/dynamic"
 	kubeclientset "k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -116,6 +119,7 @@ type FederationSyncController struct {
 	templateClient util.ResourceClient
 
 	fedNamespace string
+	cgController *configgeneration.ConfigGenerationController
 }
 
 // StartFederationSyncController starts a new sync controller for a type config
@@ -129,6 +133,7 @@ func StartFederationSyncController(typeConfig typeconfig.Interface, kubeConfig *
 	}
 	glog.Infof(fmt.Sprintf("Starting sync controller for %s resources", typeConfig.GetTemplate().Kind))
 	controller.Run(stopChan)
+
 	return nil
 }
 
@@ -293,6 +298,15 @@ func newFederationSyncController(typeConfig typeconfig.Interface, kubeConfig *re
 		s.informer,
 		s.updater,
 	)
+
+	cgController, err := configgeneration.NewConfigGenerationController(typeConfig.GetTemplate().Kind)
+	if err != nil {
+		glog.Errorf(fmt.Sprintf("Error in NewConfigGenerationController. error: %s", err.Error()))
+		return nil, err
+	}
+	s.cgController = cgController
+	// TODO: I'm thinking if we can start a common controller for all resources
+	glog.Infof(fmt.Sprintf("Starting config generation controller for %s resources", typeConfig.GetTemplate().Kind))
 
 	return s, nil
 }
@@ -509,7 +523,18 @@ func (s *FederationSyncController) reconcile(qualifiedName util.QualifiedName) u
 		propagatedVersion = propagatedVersionFromCache.(*fedv1a1.PropagatedVersion)
 	}
 
-	return s.syncToClusters(selectedClusters, unselectedClusters, template, override, propagatedVersion)
+	glog.Infof("CONFIG GENERATION: Decision selectedClusters %s unselectedClusters %s template %s",
+		selectedClusters, unselectedClusters, template)
+	glog.Infof("CONFIG GENERATION: Decision override %s propagatedVersion %s", override, propagatedVersion)
+
+	// TODO: by default, if config generation configured, we use push mode. We need to make this configurable
+	if utilfeature.DefaultFeatureGate.Enabled(features.GenerationConfiguration) {
+		glog.Infof("CONFIG GENERATION: using GenerationConfiguration")
+		return s.syncToConfigGeneration(selectedClusters, unselectedClusters, template, override, propagatedVersion)
+	} else {
+		glog.Infof("CONFIG GENERATION: using Push Reconcile")
+		return s.syncToClusters(selectedClusters, unselectedClusters, template, override, propagatedVersion)
+	}
 }
 
 func (s *FederationSyncController) rawObjFromCache(store cache.Store, kind, key string) (pkgruntime.Object, error) {
@@ -633,6 +658,50 @@ func (s *FederationSyncController) syncToClusters(selectedClusters, unselectedCl
 			key, operationErrors))
 		return util.StatusError
 	}
+
+	return util.StatusAllOK
+}
+
+// TODO: a framework for different backend
+func (s *FederationSyncController) syncToConfigGeneration(selectedClusters, unselectedClusters []string,
+	template, override *unstructured.Unstructured, propagatedVersion *fedv1a1.PropagatedVersion) util.ReconciliationStatus {
+
+	templateKind := s.typeConfig.GetTemplate().Kind
+	key := util.NewQualifiedName(template).String()
+
+	propagatedClusterVersions := getClusterVersions(template, override, propagatedVersion)
+
+	operations, err := s.clusterOperations(selectedClusters, unselectedClusters, template,
+		override, key, propagatedClusterVersions)
+	if err != nil {
+		s.eventRecorder.Eventf(template, corev1.EventTypeWarning, "FedClusterOperationsError",
+			"Error obtaining sync operations for %s: %s error: %s", templateKind, key, err.Error())
+		return util.StatusError
+	}
+
+	if len(operations) == 0 {
+		return util.StatusAllOK
+	}
+
+	s.cgController.Update(operations)
+
+	// TODO: propagation should be considered later
+	/*
+		updatedClusterVersions := make(map[string]string)
+		updatedClusterVersions["cluster2"] = "1"
+
+		defer func() {
+			err = updatePropagatedVersion(s.typeConfig, s.fedClient, updatedClusterVersions, template, override,
+				propagatedVersion, selectedClusters, s.pendingVersionUpdates)
+			if err != nil {
+				runtime.HandleError(fmt.Errorf("Failed to record propagated version for %s %q: %v", templateKind,
+					key, err))
+				// Failure to record the propagated version does not imply
+				// that propagation for the resource needs to be attempted
+				// again.
+			}
+		}()
+	*/
 
 	return util.StatusAllOK
 }
